@@ -154,6 +154,7 @@ _SUBCOMMANDS = (
     "run",
     "eval-set",
     "inspect",
+    "compare",
     "summarize",
     "view",
     "video",
@@ -430,6 +431,31 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SCENE-eEPOCH",
         help="select a captured trial for --wire CALL",
     )
+
+    p_compare = sub.add_parser(
+        "compare",
+        help="compare two saved runs of the same task, scene by scene, with intervals",
+    )
+    p_compare.add_argument("log_a", help="path to the first EvalLog JSON file (A)")
+    p_compare.add_argument("log_b", help="path to the second EvalLog JSON file (B)")
+    p_compare.add_argument(
+        "--scorer",
+        action="append",
+        default=None,
+        metavar="NAME",
+        help="scorer to compare (repeatable); default: every scorer both logs share",
+    )
+    p_compare.add_argument(
+        "--alpha", type=float, default=0.05, help="two-sided significance level (default 0.05)"
+    )
+    p_compare.add_argument(
+        "--min-coverage",
+        type=float,
+        default=0.95,
+        help="scored/attempted trials below which no winner is named (default 0.95)",
+    )
+    p_compare.add_argument("--seed", type=int, default=0, help="seed for resampling")
+    p_compare.add_argument("--json", action="store_true", help="print machine-readable JSON")
 
     p_summarize = sub.add_parser(
         "summarize",
@@ -2828,6 +2854,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             transcript=args.transcript,
             wire=args.wire,
             trial=args.trial,
+        )
+    if args.command == "compare":
+        from inspect_robots._compare import run_compare
+
+        return run_compare(
+            args.log_a,
+            args.log_b,
+            scorers=args.scorer,
+            alpha=args.alpha,
+            min_coverage=args.min_coverage,
+            seed=args.seed,
+            as_json=args.json,
         )
     if args.command == "summarize":
         return _cmd_summarize(args)

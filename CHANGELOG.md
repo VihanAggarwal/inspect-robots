@@ -12,7 +12,8 @@ All notable changes to this project are documented here. The format is based on
 - **Core:** `inspect_robots.evidence` and `inspect-robots compare`: scene-clustered intervals and
   trial coverage for every metric, and scene-paired comparison of two runs with exact sign and
   permutation tests, Holm correction across scorers, a detectable-difference and scene-planning
-  estimate, and refusals for low coverage, mismatched tasks and designs too small to separate
+  estimate, an anytime-valid sequential test that stays valid when checked after every scene,
+  and refusals for low coverage, mismatched tasks and designs too small to separate
   anything. Works on existing logs with no schema change
   ([plan 0082](plans/0082-evidence-layer.md),
   [#440](https://github.com/robocurve/inspect-robots/issues/440)).

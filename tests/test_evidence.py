@@ -401,3 +401,67 @@ def test_a_clean_sweep_on_five_scenes_cannot_separate_and_says_so() -> None:
     six = paired([0.9] * 6, [0.1] * 6)
     assert six.verdict == "a_better"
     assert not any("cannot reach" in w for w in six.warnings)
+
+
+# -- anytime-valid sequential test --------------------------------------------
+
+
+@pytest.mark.parametrize("statistic", ["sign", "mean"])
+def test_sequential_test_holds_its_error_under_optional_stopping(statistic: str) -> None:
+    """Looking after every one of 100 scenes must still stop falsely at most alpha of the time."""
+    rng = np.random.default_rng(0)
+    stops = sum(
+        evidence.anytime_valid_test(
+            np.clip(rng.normal(0.0, 0.2, 100), -1, 1),
+            statistic=statistic,  # type: ignore[arg-type]
+        ).stopped_at
+        is not None
+        for _ in range(1500)
+    )
+    assert stops / 1500 <= 0.05
+
+
+def test_sequential_test_stops_early_on_a_consistent_gap() -> None:
+    by_sign = evidence.anytime_valid_test([0.3] * 60)
+    assert by_sign.stopped_at == 8 and by_sign.direction == "a_better"
+    assert by_sign.e_value == by_sign.e_values[7] >= 20.0
+    by_mean = evidence.anytime_valid_test([-0.3] * 60, statistic="mean")
+    assert by_mean.stopped_at == 20 and by_mean.direction == "b_better"
+
+
+def test_sequential_test_without_a_stop_reports_the_final_e_value() -> None:
+    result = evidence.anytime_valid_test([0.1, -0.1, 0.0, 0.1])
+    assert result.stopped_at is None and result.direction is None
+    assert result.e_value == result.e_values[-1]
+    assert evidence.anytime_valid_test([]).e_value == 1.0
+
+
+def test_sequential_test_argument_validation() -> None:
+    with pytest.raises(ValueError, match="statistic"):
+        evidence.anytime_valid_test([0.1], statistic="median")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="bound"):
+        evidence.anytime_valid_test([0.1], bound=0.0)
+    with pytest.raises(ValueError, match="exceeds the bound"):
+        evidence.anytime_valid_test([2.0], statistic="mean")
+
+
+def test_compare_carries_the_sequential_result_only_for_bounded_scores() -> None:
+    c = paired([0.9] * 12, [0.1] * 12)
+    assert c.stopped_at == 8 and c.e_value >= 20.0
+    log_a = make_log({f"s{i}": [30.0] for i in range(6)}, scorer="steps")
+    log_b = make_log({f"s{i}": [10.0] for i in range(6)}, scorer="steps")
+    unbounded = compare_logs(log_a, log_b, "steps")
+    assert math.isnan(unbounded.e_value) and unbounded.stopped_at is None
+
+
+def test_cli_prints_the_stop_column(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    a = write(make_log({f"s{i}": [0.9] for i in range(10)}), tmp_path / "a.json")
+    b = write(make_log({f"s{i}": [0.1] for i in range(10)}), tmp_path / "b.json")
+    assert run_compare(a, b) == 0
+    out = capsys.readouterr().out
+    assert "stop@" in out and "8/10" in out
+    from inspect_robots._compare import _fmt_e
+
+    assert _fmt_e(21.5) == "21.5"
+    assert _fmt_e(123456.0) == "1.2e+05"
+    assert _fmt_e(float("nan")) == "n/a"

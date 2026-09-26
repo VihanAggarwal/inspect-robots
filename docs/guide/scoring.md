@@ -92,6 +92,19 @@ comparison cannot separate two policies at 0.05 even when one wins every scene.
 `evidence.scenes_to_reach(alpha)` gives the minimum, and `compare_logs` warns when a comparison is
 below it. See [`inspect-robots compare`](cli.md#inspect-robots-compare) for the command-line form.
 
+Checking a fixed-design test after every scene and stopping once it looks good inflates the error:
+in simulation on real scene noise, that protocol declared a winner under no true difference in 18
+to 36% of runs. `evidence.anytime_valid_test` is safe to read after every scene, and
+`compare_logs` reports its e-value and the scene at which it could have stopped:
+
+```python
+from inspect_robots.evidence import anytime_valid_test
+
+result = anytime_valid_test([a - b for a, b in zip(scores_a, scores_b)])
+if result.stopped_at is not None:
+    print(f"stop after {result.stopped_at} scenes: {result.direction}")
+```
+
 ## Operator and VLM scoring (real world)
 
 Real robots have no privileged success oracle. The dominant method is a human

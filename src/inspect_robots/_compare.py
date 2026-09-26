@@ -93,6 +93,16 @@ def _fmt(value: float, digits: int = 3) -> str:
     return "n/a" if not math.isfinite(value) else f"{value:.{digits}f}"
 
 
+def _fmt_e(value: float) -> str:
+    if not math.isfinite(value):
+        return "n/a"
+    return f"{value:.1f}" if value < 1000 else f"{value:.1e}"
+
+
+def _fmt_stop(c: Comparison) -> str:
+    return f"{c.stopped_at}/{c.n_paired_scenes}" if c.stopped_at is not None else "-"
+
+
 def _fmt_p(value: float) -> str:
     return "n/a" if not math.isfinite(value) else f"{value:.4f}"
 
@@ -118,7 +128,8 @@ def _print_report(
     print()
     header = (
         f"{'scorer':24s} {'A mean':>7s} {'B mean':>7s} {'A-B':>8s} "
-        f"{f'{level}% CI':>18s} {'W-L-T':>9s} {'p':>8s} {'p holm':>8s} {'MDE':>7s}  verdict"
+        f"{f'{level}% CI':>18s} {'W-L-T':>9s} {'p':>8s} {'p holm':>8s} {'MDE':>7s} "
+        f"{'e':>7s} {'stop@':>7s}  verdict"
     )
     print(header)
     print("-" * len(header))
@@ -129,12 +140,14 @@ def _print_report(
         print(
             f"{c.scorer:24s} {_fmt(c.a.mean):>7s} {_fmt(c.b.mean):>7s} {_fmt(c.delta):>8s} "
             f"{ci:>18s} {wlt:>9s} {_fmt_p(c.p_permutation):>8s} "
-            f"{_fmt_p(adjusted[c.scorer]):>8s} {_fmt(c.mde):>7s}  {verdict}"
+            f"{_fmt_p(adjusted[c.scorer]):>8s} {_fmt(c.mde):>7s} {_fmt_e(c.e_value):>7s} "
+            f"{_fmt_stop(c):>7s}  {verdict}"
         )
     print()
     print(
         "Intervals and tests resample and permute whole scenes; W-L-T counts scenes. "
-        "MDE is the difference this design had an 80% chance to detect."
+        "MDE is the difference this design had an 80% chance to detect. e is the anytime-valid "
+        "e-value and stop@ the scene at which checking after every scene could have stopped."
     )
     warnings = dict.fromkeys(w for c in results for w in c.warnings)
     for warning in warnings:

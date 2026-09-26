@@ -74,6 +74,33 @@ bb_binary_success          0.933   0.067    0.867     [0.667, 1.000]    13-0-2  
 bb_graded_success          0.979   0.380    0.599     [0.470, 0.708]    15-0-0   0.0001   0.0002   0.176  A better
 ```
 
+## Stopping a head-to-head early
+
+On a robot every scene costs operator time, so the natural protocol is to watch the result and
+stop once it is clear. Done with the fixed-design tests above, that is invalid: they assume the
+scene count was fixed in advance. Simulated on scene-difference noise measured in a real
+three-model benchmark run, an operator who checks after every scene from 6 to 60 and stops at
+p < 0.05 declares a winner under no true difference in **35 to 36%** of runs with a z-test and
+**18%** with the exact sign test, against a nominal 5%.
+
+`anytime_valid_test(diffs, alpha=0.05, statistic="sign")` is built to be read that way: a betting
+e-process (Waudby-Smith and Ramdas) whose chance of ever crossing `1 / alpha` under the null is at
+most `alpha` by Ville's inequality. `compare_logs` runs it on the paired scenes in log order and
+reports the e-value and the scene at which checking after every scene could have stopped (`e` and
+`stop@` in the CLI). On the same noise:
+
+| true gap | fixed 20 scenes, power | fixed 60, power | anytime (sign), power within 60 | mean scenes used |
+| --- | --- | --- | --- | --- |
+| 0.30 | 99.9% | 100% | 100% | 14.7 |
+| 0.20 | 92.2% | 100% | 87.5% | 32.6 |
+| 0.10 | 40.3% | 83.9% | 28.1% | 52.4 |
+
+False winners under peeking: 1.9% for the anytime test. On clear gaps it stops after a quarter of
+a 60-scene budget; on small, noisy gaps a fixed 60-scene design is more powerful. The honest
+protocol is sequential stopping with a fixed-budget backstop, and the defaults say so: the sign
+statistic is the default because the mean form, which must assume differences can span the whole
+[-1, 1] range, stops later on the small differences robot scores produce.
+
 ## Why scenes, and why post hoc
 
 Epochs of a scene share its world, so they are correlated draws, and in a benchmark that
@@ -90,9 +117,10 @@ a robot.
 
 - Writing intervals into `EvalResults` at eval time (a later, additive schema change once the
   statistics have settled).
-- Anytime-valid sequential comparison, so an operator can stop a head-to-head on a real robot as
-  soon as the evidence is sufficient (STEP, arXiv 2503.10966; SAVI-based comparison, arXiv
-  2603.13616). The paired per-scene differences here are the natural input to it.
+- A live `eval --stop-when-separated` mode that runs the anytime test between scenes and ends the
+  run itself. The test here is the decision rule; wiring it into the rollout loop is separate.
+- Sequential designs with a minimum sample (STEP, arXiv 2503.10966) and SAVI-based comparison of
+  graded metrics (arXiv 2603.13616), both natural extensions of the same per-scene differences.
 - `eval-set`-level comparison across many tasks with one family-wise correction.
 
 ## Tests

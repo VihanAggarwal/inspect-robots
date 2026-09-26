@@ -8,6 +8,7 @@ and answers two questions without touching the log format:
 - :func:`metric_evidence`: how precisely is each metric known, and how many of the trials the run
   set out to score actually produced a score?
 - :func:`compare_logs`: given two runs of the same task, is one better, by how much, and how sure?
+- :func:`anytime_valid_test`: may a head-to-head stop now? Safe to ask after every scene.
 
 Three rules are built in, because each one was learned from a real benchmark going wrong:
 
@@ -44,6 +45,8 @@ from inspect_robots.log import EvalLog
 __all__ = [
     "Comparison",
     "MetricEvidence",
+    "SequentialTest",
+    "anytime_valid_test",
     "compare_logs",
     "holm",
     "metric_evidence",
@@ -58,6 +61,11 @@ DEFAULT_N_BOOT = 4000
 
 #: Coverage below which a comparison is reported but no winner is named.
 DEFAULT_MIN_COVERAGE = 0.95
+
+#: Cap on the fraction of wealth staked per scene in :func:`anytime_valid_test`. Any value below 1
+#: keeps the test valid (wealth stays positive); 0.75 is the upper end of what Waudby-Smith and
+#: Ramdas recommend, trading a little robustness for faster stopping on consistent gaps.
+MAX_STAKE = 0.75
 
 #: Largest scene count for which the paired permutation test enumerates every sign pattern
 #: exactly (2**16 = 65,536 patterns). Above it the test samples ``n_perm`` patterns.
@@ -130,6 +138,12 @@ class Comparison:
     sd_difference: float
     unpaired_scenes: tuple[str, ...] = ()
     warnings: tuple[str, ...] = field(default_factory=tuple)
+    #: The anytime-valid e-value after the last paired scene, in log A's scene order, and the
+    #: first scene count at which it crossed ``1 / alpha``. ``nan`` and ``None`` when a per-scene
+    #: mean falls outside [0, 1], since the test needs bounded scores. See
+    #: :func:`anytime_valid_test`.
+    e_value: float = float("nan")
+    stopped_at: int | None = None
 
     @property
     def mde(self) -> float:
@@ -333,6 +347,10 @@ def compare_logs(
         ci_low = ci_high = float("nan")
     p_sign = sign_test(wins, losses)
     p_perm = paired_permutation_p(diffs, n_perm=n_perm, rng=rng)
+    bounded = all(
+        0.0 <= float(np.mean(side[s])) <= 1.0 for side in (scenes_a, scenes_b) for s in paired
+    )
+    sequential = anytime_valid_test(diffs, alpha=alpha) if bounded else None
 
     verdict: Verdict
     if low_coverage:
@@ -361,6 +379,8 @@ def compare_logs(
         sd_difference=sd,
         unpaired_scenes=unpaired,
         warnings=tuple(warnings),
+        e_value=sequential.e_value if sequential else float("nan"),
+        stopped_at=sequential.stopped_at if sequential else None,
     )
 
 
@@ -460,6 +480,104 @@ def holm(p_values: Mapping[str, float]) -> dict[str, float]:
         running = max(running, min(1.0, (m - rank) * p))
         adjusted[name] = running
     return {name: adjusted[name] for name in p_values}
+
+
+# -- anytime-valid sequential testing ----------------------------------------
+
+
+@dataclass(frozen=True)
+class SequentialTest:
+    """A betting e-process over paired scene differences, read after every scene.
+
+    ``e_values[k]`` is the evidence against "no difference" after ``k + 1`` scenes. By Ville's
+    inequality the chance it *ever* reaches ``1 / alpha`` under the null is at most ``alpha``, so
+    the test may be consulted after every scene and stopped the first time it crosses, and the
+    error guarantee still holds. ``stopped_at`` is that first scene count (1-based), or ``None``
+    if it never crossed. ``direction`` says which side the evidence favours at the stop.
+    """
+
+    e_values: tuple[float, ...]
+    stopped_at: int | None
+    direction: Literal["a_better", "b_better"] | None
+    alpha: float
+
+    @property
+    def e_value(self) -> float:
+        """The e-value at the stop, or after the last scene if it never stopped."""
+        if not self.e_values:
+            return 1.0
+        index = (self.stopped_at if self.stopped_at is not None else len(self.e_values)) - 1
+        return self.e_values[index]
+
+
+def anytime_valid_test(
+    diffs: Sequence[float] | np.ndarray,
+    *,
+    alpha: float = 0.05,
+    statistic: Literal["sign", "mean"] = "sign",
+    bound: float = 1.0,
+) -> SequentialTest:
+    """Anytime-valid two-sided test that the mean paired scene difference is zero.
+
+    With ``statistic="sign"`` (the default) each scene contributes only who won it, +1, -1, or 0
+    for a tie, and the null is that a win and a loss are equally likely. With ``"mean"`` the
+    difference itself is bet on, scaled by ``bound``, and the null is a zero mean difference.
+    The sign form stops sooner whenever differences are small against ``bound`` (a consistent
+    0.3 gap on [0, 1] scores stops in 8 scenes by sign against 20 by mean) and, as with the
+    scene win counts, one extreme scene cannot carry it.
+
+    Two test martingales bet on the next scene, one on ``a`` being better and one on
+    ``b``, each with a stake chosen from the scenes already seen (the predictable plug-in of
+    Waudby-Smith and Ramdas, capped at :data:`MAX_STAKE`), and their average is the
+    reported e-process. Differences must lie in ``[-bound, bound]``; for scores in [0, 1] the
+    default ``bound`` of 1 always holds for the mean form.
+
+    The fixed-design tests in :func:`compare_logs` are valid only if the number of scenes was fixed
+    in advance. An operator who looks after every scene and stops once the result looks good
+    breaks that assumption and inflates the error. This test is built to be read that way.
+
+    Raises:
+        ValueError: If ``alpha`` or ``bound`` is out of range, or a difference exceeds ``bound``.
+    """
+    _check_alpha(alpha)
+    if not math.isfinite(bound) or bound <= 0.0:
+        raise ValueError(f"bound must be finite and positive, got {bound!r}")
+    if statistic not in ("sign", "mean"):
+        raise ValueError(f"statistic must be 'sign' or 'mean', got {statistic!r}")
+    raw = np.asarray(diffs, dtype=np.float64)
+    if statistic == "sign":
+        x = np.sign(raw)
+    else:
+        x = raw / bound
+        if x.size and float(np.max(np.abs(x))) > 1.0 + 1e-12:
+            raise ValueError(
+                f"a difference exceeds the bound {bound!r}; the test needs bounded data"
+            )
+    threshold = 1.0 / alpha
+    up = down = 1.0
+    total = 0.0
+    total_sq = 0.0
+    values: list[float] = []
+    stopped: int | None = None
+    direction: Literal["a_better", "b_better"] | None = None
+    for count, xi in enumerate(x.tolist()):
+        # Predictable stakes from the scenes before this one, shrunk toward a zero mean and a
+        # variance of 0.25 by one pseudo-observation so the first bet is small.
+        mean = total / (count + 1)
+        var = (0.25 + total_sq - count * mean * mean) / (count + 1)
+        denom = max(var + mean * mean, 1e-12)
+        stake_up = min(max(mean / denom, 0.0), MAX_STAKE)
+        stake_down = min(max(-mean / denom, 0.0), MAX_STAKE)
+        up *= 1.0 + stake_up * xi
+        down *= 1.0 - stake_down * xi
+        e_value = 0.5 * (up + down)
+        values.append(e_value)
+        total += xi
+        total_sq += xi * xi
+        if stopped is None and e_value >= threshold:
+            stopped = count + 1
+            direction = "a_better" if up >= down else "b_better"
+    return SequentialTest(tuple(values), stopped, direction, alpha)
 
 
 # -- helpers -----------------------------------------------------------------

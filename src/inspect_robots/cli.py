@@ -469,6 +469,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.95,
         help="scored/attempted trials below which no winner is named (default 0.95)",
     )
+    p_compare.add_argument(
+        "--lower-is-better",
+        action="append",
+        default=[],
+        metavar="SCORER",
+        help="read SCORER with smaller values winning (repeatable; min_distance_to_goal "
+        "already is)",
+    )
     p_compare.add_argument("--seed", type=int, default=0, help="seed for resampling")
     p_compare.add_argument("--json", action="store_true", help="print machine-readable JSON")
 
@@ -2937,6 +2945,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             min_coverage=args.min_coverage,
             seed=args.seed,
             as_json=args.json,
+            lower_is_better=args.lower_is_better,
         )
     if args.command == "summarize":
         return _cmd_summarize(args)

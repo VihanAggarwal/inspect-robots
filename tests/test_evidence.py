@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -106,7 +107,7 @@ def test_errored_trials_lower_coverage_not_the_mean() -> None:
     ev = metric_evidence(log)["success"]
     assert (ev.scored_trials, ev.attempted_trials) == (4, 6)
     assert ev.coverage == pytest.approx(4 / 6)
-    assert ev.mean == pytest.approx(0.75)
+    assert ev.mean == pytest.approx(2 / 3)  # scenes weigh equally, as in results.metrics
 
 
 def test_single_scene_has_no_interval_and_missing_scorer_is_reported() -> None:
@@ -467,3 +468,125 @@ def test_cli_prints_the_stop_column(tmp_path: Path, capsys: pytest.CaptureFixtur
     assert _fmt_e(21.5) == "21.5"
     assert _fmt_e(123456.0) == "1.2e+05"
     assert _fmt_e(float("nan")) == "n/a"
+
+
+# -- review regressions: per-scorer coverage, reducers, direction, scale, strict JSON ---------
+
+
+def _raw_log(
+    scenes: Mapping[str, tuple[Sequence[dict[str, float | None]], dict[str, float | None]]],
+) -> EvalLog:
+    """A log from explicit ``(epochs, reduced)`` per scene, for cases ``make_log`` cannot build."""
+    base = make_log({"x": [1.0]})
+    samples = tuple(
+        SceneResult(scene_id=sid, status="success", epochs=tuple(epochs), reduced=reduced)
+        for sid, (epochs, reduced) in scenes.items()
+    )
+    return EvalLog(base.version, base.status, base.eval, base.results, base.stats, samples)
+
+
+def test_coverage_counts_only_trials_this_scorer_scored() -> None:
+    # Ten trials per scene; "success" has a value on one of them, "other" on all ten.
+    def side(value: float) -> EvalLog:
+        epochs: list[dict[str, float | None]] = [{"success": value, "other": 1.0}]
+        epochs += [{"success": None, "other": 1.0}] * 9
+        return _raw_log({f"s{i}": (epochs, {}) for i in range(8)})
+
+    a, b = side(1.0), side(0.0)
+    ev = metric_evidence(a)
+
+    assert (ev["success"].scored_trials, ev["success"].attempted_trials) == (8, 80)
+    assert ev["other"].coverage == 1.0
+    c = compare_logs(a, b, "success")
+    assert c.verdict == "insufficient_coverage"
+    assert any("a scored 8 of 80 trials" in w for w in c.warnings)
+
+
+def test_scene_scores_follow_the_saved_reducer() -> None:
+    # Under a max reducer A solves every scene once in ten tries; B scores 0.6 every time.
+    a_epochs: list[dict[str, float | None]] = [
+        {"success": 1.0 if k == 0 else 0.0} for k in range(10)
+    ]
+    b_epochs: list[dict[str, float | None]] = [{"success": 0.6}] * 10
+    a = _raw_log({f"s{i}": (a_epochs, {"success": 1.0}) for i in range(8)})
+    b = _raw_log({f"s{i}": (b_epochs, {"success": 0.6}) for i in range(8)})
+
+    assert metric_evidence(a)["success"].mean == pytest.approx(1.0)
+    c = compare_logs(a, b, "success")
+    assert c.delta == pytest.approx(0.4)
+    assert c.verdict == "a_better"
+
+
+def test_an_abstained_reduced_value_drops_the_scene() -> None:
+    log = _raw_log(
+        {
+            "s0": ([{"success": 1.0}], {"success": 1.0}),
+            "s1": ([{"success": 0.0}], {"success": None}),
+            "s2": ([{"success": 0.0}], {}),
+        }
+    )
+
+    ev = metric_evidence(log)["success"]
+    assert ev.n_scenes == 2  # s1 abstained at the reducer; s2 falls back to its epochs
+    assert ev.mean == pytest.approx(0.5)
+
+
+def test_lower_is_better_scorers_name_the_smaller_value_the_winner() -> None:
+    a = make_log({f"s{i}": [0.9] for i in range(8)}, scorer="min_distance_to_goal")
+    b = make_log({f"s{i}": [0.1] for i in range(8)}, scorer="min_distance_to_goal")
+
+    builtin = compare_logs(a, b, "min_distance_to_goal")
+    assert builtin.lower_is_better
+    assert builtin.delta == pytest.approx(0.8)
+    assert (builtin.wins, builtin.losses) == (0, 8)
+    assert builtin.verdict == "b_better"
+    assert _final_verdict(builtin, 0.001) == "b_better"
+    assert _final_verdict(replace(builtin, delta=-0.8), 0.001) == "a_better"
+
+    custom_a = make_log({f"s{i}": [0.9] for i in range(8)}, scorer="time_s")
+    custom_b = make_log({f"s{i}": [0.1] for i in range(8)}, scorer="time_s")
+    assert compare_logs(custom_a, custom_b, "time_s").verdict == "a_better"
+    assert compare_logs(custom_a, custom_b, "time_s", lower_is_better=True).verdict == "b_better"
+
+
+def test_cli_lower_is_better_flag_and_coverage_column(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    a = write(make_log({f"s{i}": [0.9] for i in range(8)}, scorer="time_s"), tmp_path / "a.json")
+    b = write(make_log({f"s{i}": [0.1] for i in range(8)}, scorer="time_s"), tmp_path / "b.json")
+
+    assert main(["compare", a, b, "--lower-is-better", "time_s"]) == 0
+    out = capsys.readouterr().out
+    assert "time_s (lower)" in out
+    assert "B better" in out
+    assert "1.00/1.00" in out
+
+
+def test_large_scene_counts_do_not_overflow() -> None:
+    assert evidence.min_attainable_p(1100) == 0.0  # 2 / 2**1100 underflows instead of raising
+    n = 1100
+    a = make_log({f"s{i}": [1.0 if i % 3 else 0.0] for i in range(n)})
+    b = make_log({f"s{i}": [0.0] for i in range(n)})
+
+    c = compare_logs(a, b, "success", n_boot=50, n_perm=200)
+    assert c.n_paired_scenes == n
+    assert c.verdict == "a_better"
+
+
+def test_json_output_is_strict_when_statistics_are_undefined(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    a = write(make_log({"s0": [1.0]}), tmp_path / "a.json")
+    b = write(make_log({"s0": [0.0]}), tmp_path / "b.json")
+
+    assert main(["compare", a, b, "--json"]) == 0
+    out = capsys.readouterr().out
+
+    def reject(token: str) -> None:
+        raise ValueError(f"non-standard JSON token {token}")
+
+    payload = json.loads(out, parse_constant=reject)
+    row = payload["comparisons"][0]
+    assert row["ci_low"] is None
+    assert row["mde"] is None
+    assert row["unpaired_scenes"] == []

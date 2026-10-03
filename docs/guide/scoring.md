@@ -82,20 +82,24 @@ a = read_eval_log("logs/policy_a.json")
 b = read_eval_log("logs/policy_b.json")
 
 ev = metric_evidence(a)["success"]
-print(ev.mean, ev.ci_low, ev.ci_high, ev.coverage)   # scene-clustered 95% interval
+print(ev.mean, ev.ci_low, ev.ci_high, ev.coverage)   # scene-resampled 95% interval
 
 c = compare_logs(a, b, "success")
 print(c.verdict, c.delta, c.wins, c.losses, c.p_permutation, c.mde)
 print(c.scenes_needed(0.05))                          # plan the next run
 ```
 
-Three rules are built in:
+Four rules are built in:
 
 - **Scenes are the unit:** epochs of one scene share a world, so intervals resample whole scenes
   and tests permute whole scenes. Adding epochs does not narrow an interval that more scenes would.
-- **Coverage travels with the number:** errored trials are never scored, so a mean can be a mean
-  over survivors. Every summary reports scored against attempted trials, and a comparison names no
-  winner when either side is below `min_coverage` (0.95 by default).
+- **Coverage travels with the number:** errored and abstained trials are never scored, so a mean
+  can be a mean over survivors. Every summary reports, per scorer, scored against attempted trials,
+  and a comparison names no winner when either side is below `min_coverage` (0.95 by default).
+- **The saved metric decides:** each scene contributes its reduced score (the task's epoch
+  reducer, so `max` or `pass_at_2` is respected) and scenes weigh equally, as in
+  `results.metrics`. Lower-is-better scorers (`min_distance_to_goal` built in, or
+  `lower_is_better=True`) name the smaller value the winner; `delta` stays `A - B` either way.
 - **Pair by scene:** two runs of the same task see the same scenes, so the comparison is made
   scene by scene. The win, loss and tie counts show when one hard scene is carrying a difference.
 

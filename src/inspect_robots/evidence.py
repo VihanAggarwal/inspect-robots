@@ -16,11 +16,16 @@ Three rules are built in, because each one was learned from a real benchmark goi
 not independent draws. Every interval resamples whole scenes, and every test permutes whole scenes.
 Adding epochs narrows nothing that more scenes would not narrow further.
 
-**Coverage travels with every number.** A trial that errors is recorded but never scored, and the
-run-level mean averages whatever survived. When the lost trials are not a random subset (a rate
-limit, a spend cap, a crash that hits long rollouts first) the survivor mean is biased in a
-direction the log cannot reveal. Every summary here reports scored against attempted trials, and a
-comparison refuses to call a winner when either side falls below ``min_coverage``.
+**Coverage travels with every number.** A trial that errors, or that a scorer abstains on, is
+recorded but never scored, and the run-level mean averages whatever survived. When the lost trials
+are not a random subset (a rate limit, a spend cap, a crash that hits long rollouts first) the
+survivor mean is biased in a direction the log cannot reveal. Every summary here reports, per
+scorer, scored against attempted trials, and a comparison refuses to call a winner when either side
+falls below ``min_coverage``.
+
+**Respect the saved metric.** Each scene contributes its saved reduced score
+(``SceneResult.reduced``, from the task's epoch reducer) and scenes weigh equally, exactly as
+``results.metrics`` was computed, so a comparison never contradicts the metric the task reports.
 
 **Pair by scene.** Two runs of the same task see the same scenes, so the comparison is made scene
 by scene rather than mean against mean. A single hard scene can dominate a difference of means
@@ -39,8 +44,9 @@ from statistics import NormalDist
 from typing import Literal, TypeGuard
 
 import numpy as np
+import numpy.typing as npt
 
-from inspect_robots.log import EvalLog
+from inspect_robots.log import EvalLog, SceneResult
 
 __all__ = [
     "Comparison",
@@ -71,6 +77,10 @@ MAX_STAKE = 0.75
 #: exactly (2**16 = 65,536 patterns). Above it the test samples ``n_perm`` patterns.
 EXACT_PERMUTATION_MAX_SCENES = 16
 
+#: Built-in scorers for which a smaller value is the better outcome. ``compare_logs`` reads these
+#: in that direction unless told otherwise; any other scorer is read as higher-is-better.
+LOWER_IS_BETTER: frozenset[str] = frozenset({"min_distance_to_goal"})
+
 Verdict = Literal[
     "a_better",
     "b_better",
@@ -82,13 +92,13 @@ Verdict = Literal[
 
 @dataclass(frozen=True)
 class MetricEvidence:
-    """One scorer's mean with a scene-clustered interval and the trial accounting behind it.
+    """One scorer's mean with a scene-resampled interval and the trial accounting behind it.
 
-    ``mean`` is the trial-weighted mean over scored trials, the same quantity a reader would
-    compute from the log. ``ci_low``/``ci_high`` resample whole scenes and are ``nan`` when fewer
-    than two scenes produced a score, since between-scene variation is then unidentifiable.
-    ``coverage`` is ``scored_trials / attempted_trials`` for the whole run, so it is the same for
-    every scorer of one log.
+    ``mean`` is the mean over scenes of each scene's saved reduced score, the quantity
+    ``results.metrics`` reports. ``ci_low``/``ci_high`` resample whole scenes and are ``nan`` when
+    fewer than two scenes produced a score, since between-scene variation is then unidentifiable.
+    ``coverage`` is ``scored_trials / attempted_trials`` for this scorer: a trial counts as scored
+    only when it carries a finite value for it, so errors and abstentions both lower it.
     """
 
     scorer: str
@@ -102,7 +112,7 @@ class MetricEvidence:
 
     @property
     def coverage(self) -> float:
-        """Fraction of attempted trials that produced a score; ``nan`` for an empty run."""
+        """Fraction of attempted trials scored by this scorer; ``nan`` for an empty run."""
         if self.attempted_trials == 0:
             return float("nan")
         return self.scored_trials / self.attempted_trials
@@ -112,13 +122,15 @@ class MetricEvidence:
 class Comparison:
     """Log ``a`` against log ``b`` on one scorer, paired scene by scene.
 
-    ``delta`` is ``mean(a) - mean(b)`` over the paired scenes, each scene weighted equally, with a
-    scene-resampled interval. ``wins``/``losses``/``ties`` count scenes where ``a`` scored above,
-    below, or level with ``b``. ``p_sign`` is the exact two-sided sign test on that count and
-    ``p_permutation`` the two-sided paired sign-flip test on the scene differences; ``verdict``
-    reads the latter against ``alpha``. ``mde`` is the difference this comparison had an 80%
-    chance of detecting at ``alpha``, and :meth:`scenes_needed` turns a target difference into a
-    scene count, both from a normal approximation to the paired differences.
+    ``delta`` is ``mean(a) - mean(b)`` over the paired scenes' reduced scores, each scene weighted
+    equally, with a scene-resampled interval; it keeps that sign whatever the scorer's direction.
+    ``wins``/``losses``/``ties`` count scenes where ``a`` did better, worse, or level with ``b``,
+    reading "better" as lower when ``lower_is_better``. ``p_sign`` is the exact two-sided sign
+    test on that count and ``p_permutation`` the two-sided paired sign-flip test on the scene
+    differences; ``verdict`` reads the latter against ``alpha``. ``mde`` is the difference this
+    comparison had an 80% chance of detecting at ``alpha``, and :meth:`scenes_needed` turns a
+    target difference into a scene count, both from a normal approximation to the paired
+    differences.
     """
 
     scorer: str
@@ -144,6 +156,9 @@ class Comparison:
     #: :func:`anytime_valid_test`.
     e_value: float = float("nan")
     stopped_at: int | None = None
+    #: Whether a smaller value of this scorer is the better outcome. Verdicts, win counts and the
+    #: sequential test all read the difference in this direction.
+    lower_is_better: bool = False
 
     @property
     def mde(self) -> float:
@@ -173,21 +188,38 @@ class Comparison:
 # -- per-log accounting ------------------------------------------------------
 
 
-def _scene_scores(log: EvalLog, scorer: str) -> dict[str, list[float]]:
-    """Per-scene lists of finite per-trial values for ``scorer``, scenes with none omitted."""
-    out: dict[str, list[float]] = {}
+def _scene_scores(log: EvalLog, scorer: str) -> dict[str, float]:
+    """Each scene's score for ``scorer``, scenes without one omitted.
+
+    The saved reduced value when it is finite, so the task's epoch reducer (``max``,
+    ``pass_at_k``, ...) is respected. Logs written without one fall back to the mean of the
+    scene's finite per-trial values.
+    """
+    out: dict[str, float] = {}
     for sample in log.samples:
-        raw = (epoch.get(scorer) for epoch in sample.epochs)
-        values = [float(value) for value in raw if _is_number(value)]
-        if values:
-            out[sample.scene_id] = values
+        value = _scene_value(sample, scorer)
+        if value is not None:
+            out[sample.scene_id] = value
     return out
 
 
-def _trial_accounting(log: EvalLog) -> tuple[int, int]:
-    """``(scored, attempted)`` trials: an empty epoch dict is a trial that errored."""
+def _scene_value(sample: SceneResult, scorer: str) -> float | None:
+    reduced = sample.reduced.get(scorer)
+    if _is_number(reduced):
+        return float(reduced)
+    if scorer in sample.reduced:
+        return None  # the reducer ran and abstained (or failed) for this scene
+    raw = (epoch.get(scorer) for epoch in sample.epochs)
+    values = [float(value) for value in raw if _is_number(value)]
+    return float(np.mean(values)) if values else None
+
+
+def _trial_accounting(log: EvalLog, scorer: str) -> tuple[int, int]:
+    """``(scored, attempted)`` trials for ``scorer``: scored means a finite value for it."""
     attempted = sum(len(sample.epochs) for sample in log.samples)
-    scored = sum(1 for sample in log.samples for epoch in sample.epochs if epoch)
+    scored = sum(
+        1 for sample in log.samples for epoch in sample.epochs if _is_number(epoch.get(scorer))
+    )
     return scored, attempted
 
 
@@ -210,7 +242,7 @@ def metric_evidence(
     n_boot: int = DEFAULT_N_BOOT,
     seed: int = 0,
 ) -> dict[str, MetricEvidence]:
-    """Each scorer's mean with a scene-clustered interval and the run's trial coverage.
+    """Each scorer's mean with a scene-resampled interval and that scorer's trial coverage.
 
     Args:
         log: A finished eval log.
@@ -225,33 +257,31 @@ def metric_evidence(
     """
     _check_alpha(alpha)
     _check_n(n_boot, "n_boot")
-    scored, attempted = _trial_accounting(log)
     names = list(scorers) if scorers is not None else _scorers(log)
     rng = np.random.default_rng(seed)
     out: dict[str, MetricEvidence] = {}
     for name in names:
-        groups = list(_scene_scores(log, name).values())
-        if not groups:
+        scored, attempted = _trial_accounting(log, name)
+        values = np.array(list(_scene_scores(log, name).values()), dtype=np.float64)
+        if values.size == 0:
             nan = float("nan")
             out[name] = MetricEvidence(name, nan, nan, nan, 0, scored, attempted, alpha)
             continue
-        mean = float(np.mean([v for g in groups for v in g]))
-        low, high = _cluster_interval(groups, alpha, n_boot, rng)
-        out[name] = MetricEvidence(name, mean, low, high, len(groups), scored, attempted, alpha)
+        low, high = _scene_interval(values, alpha, n_boot, rng)
+        out[name] = MetricEvidence(
+            name, float(values.mean()), low, high, int(values.size), scored, attempted, alpha
+        )
     return out
 
 
-def _cluster_interval(
-    groups: Sequence[Sequence[float]], alpha: float, n_boot: int, rng: np.random.Generator
+def _scene_interval(
+    values: npt.NDArray[np.float64], alpha: float, n_boot: int, rng: np.random.Generator
 ) -> tuple[float, float]:
-    """Percentile interval of the trial-weighted mean, resampling whole scenes."""
-    if len(groups) < 2:
+    """Percentile interval of the scene-weighted mean, resampling whole scenes."""
+    if values.size < 2:
         return float("nan"), float("nan")
-    sums = np.array([sum(g) for g in groups], dtype=np.float64)
-    counts = np.array([len(g) for g in groups], dtype=np.float64)
-    idx = rng.integers(0, len(groups), size=(n_boot, len(groups)))
-    draws = sums[idx].sum(axis=1) / counts[idx].sum(axis=1)
-    low, high = np.quantile(draws, [alpha / 2.0, 1.0 - alpha / 2.0])
+    idx = rng.integers(0, values.size, size=(n_boot, values.size))
+    low, high = np.quantile(values[idx].mean(axis=1), [alpha / 2.0, 1.0 - alpha / 2.0])
     return float(low), float(high)
 
 
@@ -268,12 +298,15 @@ def compare_logs(
     n_boot: int = DEFAULT_N_BOOT,
     n_perm: int = 20000,
     seed: int = 0,
+    lower_is_better: bool | None = None,
 ) -> Comparison:
     """Compare two runs of the same task on one scorer, pairing their scenes.
 
     Scenes are matched by ``scene_id``; a scene scored in only one log is listed in
     ``unpaired_scenes`` and left out of every paired statistic. The verdict names a winner only
-    when both logs clear ``min_coverage`` and at least two scenes pair.
+    when both logs clear ``min_coverage`` and at least two scenes pair. ``lower_is_better`` sets
+    which direction wins; ``None`` reads the built-ins in :data:`LOWER_IS_BETTER` as lower is
+    better and every other scorer as higher is better.
 
     Raises:
         ValueError: If the two logs are of different tasks, or an argument is out of range.
@@ -289,6 +322,7 @@ def compare_logs(
             "a paired comparison needs the same scenes on both sides"
         )
 
+    lower = scorer in LOWER_IS_BETTER if lower_is_better is None else lower_is_better
     rng = np.random.default_rng(seed)
     ev_a = metric_evidence(log_a, [scorer], alpha=alpha, n_boot=n_boot, seed=seed)[scorer]
     ev_b = metric_evidence(log_b, [scorer], alpha=alpha, n_boot=n_boot, seed=seed)[scorer]
@@ -296,10 +330,9 @@ def compare_logs(
     scenes_b = _scene_scores(log_b, scorer)
     paired = [s for s in scenes_a if s in scenes_b]
     unpaired = tuple(sorted(set(scenes_a) ^ set(scenes_b)))
-    diffs = np.array(
-        [float(np.mean(scenes_a[s])) - float(np.mean(scenes_b[s])) for s in paired],
-        dtype=np.float64,
-    )
+    diffs = np.array([scenes_a[s] - scenes_b[s] for s in paired], dtype=np.float64)
+    # Oriented so that positive always means "a did better"; every test and count reads these.
+    gains = -diffs if lower else diffs
 
     warnings = list(_comparability_warnings(log_a, log_b))
     if unpaired:
@@ -324,14 +357,15 @@ def compare_logs(
             f"{scenes_to_reach(alpha)} scenes are needed before any pair can separate, and the "
             "percentile interval is optimistic at this size"
         )
-    wins = int(np.sum(diffs > 0.0))
-    losses = int(np.sum(diffs < 0.0))
+    wins = int(np.sum(gains > 0.0))
+    losses = int(np.sum(gains < 0.0))
     ties = n - wins - losses
     if n == 0:
         nan = float("nan")
         return Comparison(
             scorer, nan, nan, nan, 0, 0, 0, 0, 1.0, 1.0, alpha,
             "insufficient_scenes", ev_a, ev_b, nan, unpaired, tuple(warnings),
+            lower_is_better=lower,
         )  # fmt: skip
 
     delta = float(diffs.mean())
@@ -343,11 +377,9 @@ def compare_logs(
     else:
         ci_low = ci_high = float("nan")
     p_sign = sign_test(wins, losses)
-    p_perm = paired_permutation_p(diffs, n_perm=n_perm, rng=rng)
-    bounded = all(
-        0.0 <= float(np.mean(side[s])) <= 1.0 for side in (scenes_a, scenes_b) for s in paired
-    )
-    sequential = anytime_valid_test(diffs, alpha=alpha) if bounded else None
+    p_perm = paired_permutation_p(gains, n_perm=n_perm, rng=rng)
+    bounded = all(0.0 <= side[s] <= 1.0 for side in (scenes_a, scenes_b) for s in paired)
+    sequential = anytime_valid_test(gains, alpha=alpha) if bounded else None
 
     verdict: Verdict
     if low_coverage:
@@ -355,7 +387,7 @@ def compare_logs(
     elif n < 2:
         verdict = "insufficient_scenes"
     elif p_perm < alpha:
-        verdict = "a_better" if delta > 0.0 else "b_better"
+        verdict = "a_better" if float(gains.mean()) > 0.0 else "b_better"
     else:
         verdict = "not_separated"
     return Comparison(
@@ -378,6 +410,7 @@ def compare_logs(
         warnings=tuple(warnings),
         e_value=sequential.e_value if sequential else float("nan"),
         stopped_at=sequential.stopped_at if sequential else None,
+        lower_is_better=lower,
     )
 
 
@@ -418,7 +451,7 @@ def sign_test(wins: int, losses: int) -> float:
 
 
 def paired_permutation_p(
-    diffs: np.ndarray, *, n_perm: int = 20000, rng: np.random.Generator | None = None
+    diffs: npt.NDArray[np.float64], *, n_perm: int = 20000, rng: np.random.Generator | None = None
 ) -> float:
     """Two-sided paired sign-flip test on the mean of ``diffs``.
 
@@ -455,7 +488,7 @@ def min_attainable_p(n_scenes: int) -> float:
     """
     if n_scenes < 1:
         raise ValueError(f"n_scenes must be >= 1, got {n_scenes!r}")
-    return min(1.0, 2.0 / 2.0**n_scenes)
+    return min(1.0, math.ldexp(1.0, 1 - n_scenes))
 
 
 def scenes_to_reach(alpha: float) -> int:
@@ -508,7 +541,7 @@ class SequentialTest:
 
 
 def anytime_valid_test(
-    diffs: Sequence[float] | np.ndarray,
+    diffs: Sequence[float] | npt.NDArray[np.float64],
     *,
     alpha: float = 0.05,
     statistic: Literal["sign", "mean"] = "sign",

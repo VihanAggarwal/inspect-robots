@@ -589,14 +589,16 @@ inspect-robots compare logs/a.json logs/b.json --scorer success --json
 ```
 
 Every scorer the two logs share is compared unless `--scorer` (repeatable) names some. The report
-prints each side's mean, the paired difference with a scene-resampled interval, the scene win,
-loss and tie counts, the permutation p-value and its Holm-adjusted value across the compared
+prints each side's mean, the paired difference with a scene-resampled interval, each side's
+coverage for that scorer (`cov A/B`), the scene win, loss and tie counts, the permutation p-value and its Holm-adjusted value across the compared
 scorers, the smallest difference the design could have detected, and the anytime-valid e-value with the
 scene at which checking after every scene could have stopped (`stop@`). The verdict is `A better`,
 `B better`, `not separated`, or no verdict when coverage or scene count is too low, with a warning
 saying which. `--alpha` sets the level (0.05), `--min-coverage` the scored-trial fraction below
-which no winner is named (0.95), and `--seed` the resampling seed. Exits 2 when the logs are of
-different tasks or share no scorer.
+which no winner is named (0.95), and `--seed` the resampling seed. `--lower-is-better SCORER`
+(repeatable) reads a scorer with smaller values winning; `min_distance_to_goal` already is, and
+such rows are marked `(lower)`. `--json` writes undefined statistics as `null`. Exits 2 when the
+logs are of different tasks or share no scorer.
 
 ## `inspect-robots summarize`
 

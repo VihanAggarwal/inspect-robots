@@ -43,8 +43,11 @@ compare_logs(log_a, log_b, scorer, *, alpha=0.05, min_coverage=0.95, n_boot=4000
              n_perm=20000, seed=0) -> Comparison
 ```
 
-**`MetricEvidence`:** trial-weighted mean, a percentile interval that resamples **whole scenes**,
-`n_scenes`, `scored_trials`, `attempted_trials`, `coverage`.
+**`MetricEvidence`:** the mean over scenes of each scene's saved reduced score (as in
+`results.metrics`), a percentile interval that resamples **whole scenes**, `n_scenes`, and
+per-scorer `scored_trials`, `attempted_trials` and `coverage` (a trial counts as scored only with
+a finite value for that scorer). Lower-is-better scorers (`LOWER_IS_BETTER`, or
+`lower_is_better=True`) flip which side wins.
 
 **`Comparison`:** scenes matched by `scene_id`. `delta` is the mean per-scene difference with a
 scene-resampled interval, `wins`/`losses`/`ties` count scenes, `p_sign` is the exact sign test,
